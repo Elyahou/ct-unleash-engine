@@ -1,0 +1,119 @@
+name: build-wheels
+
+# Builds abi3 wheels (one per platform, CPython 3.8+) with maturin, plus an
+# sdist. Wheels are uploaded as artifacts and, on a tag, published.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build manylinux wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - name: Smoke-test the wheel (x86_64 only)
+        if: matrix.target == 'x86_64'
+        run: |
+          python -m pip install --find-links dist ct-unleash-engine
+          python -c "import json; from ct_unleash_engine import UnleashEngine; e=UnleashEngine(); e.take_state(json.dumps({'version':2,'features':[{'name':'f','enabled':True,'strategies':[{'name':'default'}]}]})); assert e.is_enabled('f',{}) is True; assert e.is_enabled('nope',{}) is None; print('wheel OK')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  macos:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  # Run the full test suite (unit + spec + differential) against the built wheel.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build + install
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+          manylinux: auto
+      - name: Fetch client specification
+        run: |
+          git clone --depth 1 --branch v6.1.0 https://github.com/Unleash/client-specification.git /tmp/client-spec
+          echo "CT_CLIENT_SPEC_PATH=/tmp/client-spec/specifications" >> "$GITHUB_ENV"
+      - name: Test
+        run: |
+          python -m pip install --find-links dist "ct-unleash-engine[test]"
+          python -m pip install pytest
+          python -m pytest tests/ -q
+
+  # Publish to PyPI (or a private index) only on a version tag.
+  release:
+    needs: [linux, macos, sdist, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --skip-existing dist/*
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}

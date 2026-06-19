@@ -1,0 +1,20 @@
+[package]
+name = "ct-unleash-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Fast PyO3 binding to yggdrasil-core: native-context feature flag evaluation with no JSON marshalling on the hot path."
+license = "MIT"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+unleash-yggdrasil = { version = "0.21.2", features = ["wall-clock"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -38,6 +38,18 @@ maturin develop --release       # builds + installs into the active venv
 pytest tests/                   # unit + spec-suite + differential vs the official engine
 ```
 
+## Benchmark
+
+`bench/bench.py` compares this binding against whichever `yggdrasil-engine` is
+importable (1.x or 2.0 API, PyPI wheel or a local checkout on `PYTHONPATH`).
+Rows are aligned so both engines do the same work per call.
+
+```bash
+pip install yggdrasil-engine
+maturin develop --release
+python bench/bench.py
+```
+
 ## Production wheels
 
 The binding is built with `abi3-py38`, so **one wheel per platform** works on

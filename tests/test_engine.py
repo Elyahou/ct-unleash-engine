@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from ct_unleash_engine import UnleashEngine, Variant
+from ct_unleash_engine import FeatureDefinition, UnleashEngine, Variant
 
 
 def _state(features, segments=None):
@@ -71,14 +71,22 @@ def test_flexible_rollout_100_with_user():
     assert e.is_enabled("f", {"userId": "1"}) is True
 
 
-def test_get_variant_disabled_for_unknown():
+def test_get_variant_none_for_unknown():
+    # 1.3.1 returns None when the engine has no variant; the SDK then substitutes
+    # its own DISABLED_VARIATION and logs.
     e = UnleashEngine()
     e.take_state(_state([]))
-    v = e.get_variant("nope", {})
-    assert isinstance(v, Variant)
-    assert v.name == "disabled"
-    assert v.enabled is False
-    assert v.feature_enabled is False
+    assert e.get_variant("nope", {}) is None
+
+
+def test_variant_fields_match_reference_order():
+    # The SDK returns asdict(variant) to callers, so field order is visible.
+    assert [f.name for f in dataclasses.fields(Variant)] == [
+        "name",
+        "payload",
+        "enabled",
+        "feature_enabled",
+    ]
 
 
 def test_get_variant_resolves_and_is_asdict_able():
@@ -111,9 +119,29 @@ def test_metrics_counting_and_bucket_shape():
 
 
 def test_take_state_invalid_json_raises():
+    # Like 1.3.1: the native parse failure is silent, then the custom-strategy
+    # parser's json.loads raises JSONDecodeError (a ValueError).
     e = UnleashEngine()
-    with pytest.raises(ValueError):
+    with pytest.raises(json.JSONDecodeError):
         e.take_state("not json at all")
+
+
+def test_take_state_returns_none_even_with_warnings():
+    # 1.3.1 never returns warnings, so the SDK never logs them.
+    broken = _feature(
+        "f",
+        strategies=[
+            {
+                "name": "default",
+                "constraints": [
+                    {"contextName": "x", "operator": "NUM_GT", "value": "not-a-number"}
+                ],
+            }
+        ],
+    )
+    e = UnleashEngine()
+    assert e.take_state(_state([broken, _feature("g")])) is None
+    assert e.is_enabled("g", {}) is True
 
 
 def test_take_state_get_state_roundtrip_preserves_eval():
@@ -142,10 +170,49 @@ def test_non_dict_properties_does_not_crash():
     assert e.is_enabled("f", {"properties": ["not", "a", "dict"]}) is True
 
 
-def test_custom_strategies_unsupported():
+class _Allow:
+    def __init__(self, allowed):
+        self.allowed = allowed
+        self.calls = []
+
+    def apply(self, parameters, context):
+        self.calls.append((parameters, context))
+        return context.get("userId") in self.allowed
+
+
+def test_custom_strategy_is_evaluated():
+    strat = [{"name": "allowList", "parameters": {"list": "a"}, "constraints": []}]
     e = UnleashEngine()
-    with pytest.raises(NotImplementedError):
-        e.register_custom_strategies({"x": lambda *_: True})
+    custom = _Allow({"1"})
+    e.register_custom_strategies({"allowList": custom})
+    e.take_state(_state([_feature("f", strategies=strat)]))
+    assert e.is_enabled("f", {"userId": "1"}) is True
+    assert e.is_enabled("f", {"userId": "2"}) is False
+    assert custom.calls[0] == ({"list": "a"}, {"userId": "1"})
+
+
+def test_custom_strategy_without_implementation_is_false():
+    strat = [{"name": "unregistered", "parameters": {}, "constraints": []}]
+    e = UnleashEngine()
+    e.take_state(_state([_feature("f", strategies=strat)]))
+    assert e.is_enabled("f", {}) is False
+
+
+def test_list_known_toggles_returns_feature_definitions():
+    e = UnleashEngine()
+    e.take_state(_state([_feature("f")]))
+    toggles = e.list_known_toggles()
+    assert toggles == [FeatureDefinition(name="f", project="default", type="release")]
+
+
+def test_count_toggle_uses_truthiness_like_ctypes():
+    # The SDK passes whatever a fallback function returned.
+    e = UnleashEngine()
+    e.take_state(_state([_feature("f")]))
+    for value in (None, "", 0, [], "yes", 1, [0]):
+        e.count_toggle("f", value)
+    bucket = e.get_metrics()
+    assert bucket["toggles"]["f"] == {"yes": 3, "no": 4, "variants": {}}
 
 
 def test_should_emit_impression_event():

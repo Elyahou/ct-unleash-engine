@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ct_unleash_engine import UnleashEngine
+from ct_unleash_engine import UnleashEngine, Variant
 
 
 def _spec_dir():
@@ -71,6 +71,9 @@ def test_client_specification(name, kind, state, test):
     else:
         expected = test["expectedResult"]
         v = engine.get_variant(test["toggleName"], context)
+        if v is None:
+            # 1.3.1 returns None when there is no variant; the SDK substitutes this.
+            v = Variant(name="disabled", payload=None, enabled=False, feature_enabled=False)
         assert v.name == expected["name"]
         assert v.enabled == expected["enabled"]
         if "feature_enabled" in expected:

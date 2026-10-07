@@ -1,8 +1,8 @@
 [package]
 name = "ct-unleash-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Fast PyO3 binding to yggdrasil-core that behaves exactly like yggdrasil-engine 1.3.1, with no JSON marshalling on the hot path."
+description = "Fast PyO3 binding to yggdrasil-core that behaves exactly like yggdrasil-engine 2.0.0, with no JSON marshalling on the hot path."
 license = "MIT"
 
 [lib]
@@ -19,12 +19,12 @@ abi3-py310 = ["pyo3/abi3-py310"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
-# Pinned to what yggdrasil-engine 1.3.1 ships: its native library reports core
-# 0.21.3 and embeds serde_json 1.0.150. Matching both keeps evaluation and the
+# Pinned to what yggdrasil-engine 2.0.0 ships: its native library (0.20.8) reports
+# core 0.21.5 and embeds serde_json 1.0.151. Matching both keeps evaluation and the
 # JSON fallback path identical to the reference engine. Bump them only together
 # with the reference version the differential tests run against.
-unleash-yggdrasil = { version = "=0.21.3", features = ["wall-clock"] }
-serde_json = "=1.0.150"
+unleash-yggdrasil = { version = "=0.21.5", features = ["wall-clock"] }
+serde_json = "=1.0.151"
 serde = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

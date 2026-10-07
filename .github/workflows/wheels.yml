@@ -83,7 +83,8 @@ jobs:
           name: sdist
           path: dist
 
-  # Run the full suite (unit + spec + differential against yggdrasil-engine 1.3.1)
+  # Run the full suite (unit + spec + differential against yggdrasil-engine 2.0.0 +
+  # end to end with UnleashClient 6.9.0)
   # on the oldest and newest supported interpreters. Both wheels are built; pip
   # picks cp38-abi3 on 3.8 and cp310-abi3 on 3.13, so both string paths run.
   test:
@@ -116,7 +117,7 @@ jobs:
         run: |
           # --no-index: test the wheel built above, never a same-named PyPI package.
           python -m pip install --no-index --find-links dist ct-unleash-engine
-          python -m pip install "yggdrasil-engine==1.3.1" pytest
+          python -m pip install "yggdrasil-engine==2.0.0" "UnleashClient==6.9.0" pytest
           python -m pytest tests/ -q
 
   # Publish to PyPI (or a private index) only on a version tag.

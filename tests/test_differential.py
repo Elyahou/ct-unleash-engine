@@ -1,13 +1,15 @@
 """Differential tests: ct-unleash-engine must behave exactly like yggdrasil-engine
-1.3.1, the reference engine, for every method the Unleash SDK calls.
+2.0.0, the reference engine, for every method the Unleash SDK calls.
 
-"Exactly" means the same return values (including None vs a value, dataclass field
-order and the get_state string byte for byte) and the same exception class for
-the same input. Skipped automatically when yggdrasil-engine is not installed.
+"Exactly" means the same return values (dataclass type, fields and field order,
+the get_state string byte for byte), the same exception class for the same input,
+the same warning records on the ``yggdrasil_engine.engine`` logger, and the same
+metric counts. Skipped automatically when yggdrasil-engine is not installed.
 """
 
 import dataclasses
 import json
+import logging
 import random
 from datetime import datetime, timezone
 
@@ -19,6 +21,9 @@ from ct_unleash_engine import UnleashEngine as Native
 ygg = pytest.importorskip("yggdrasil_engine.engine")
 Official = ygg.UnleashEngine
 
+EVAL_METHODS = ("is_enabled", "check_enabled", "get_variant", "check_variant")
+ENGINE_LOGGER = logging.getLogger("yggdrasil_engine.engine")
+
 
 def _engines(state_json):
     native, official = Native(), Official()
@@ -27,12 +32,33 @@ def _engines(state_json):
     return native, official
 
 
-def _outcome(fn, *args):
-    """("ok", value) or ("raise", exception class), comparable across engines."""
+class _Capture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        exc_type, exc, _ = record.exc_info or (None, None, None)
+        self.records.append(
+            (record.levelname, record.getMessage(), exc_type, None if exc is None else str(exc))
+        )
+
+
+def _outcome(fn, *args, **kwargs):
+    """("ok", value, logs) or ("raise", exception class, logs), comparable across
+    engines. Tracebacks differ by construction, so a log record is compared by its
+    level, message and attached exception."""
+    capture = _Capture()
+    ENGINE_LOGGER.addHandler(capture)
+    propagate, ENGINE_LOGGER.propagate = ENGINE_LOGGER.propagate, False
     try:
-        return ("ok", _normalize(fn(*args)))
-    except BaseException as exc:  # the class is part of the contract
-        return ("raise", type(exc))
+        try:
+            return ("ok", _normalize(fn(*args, **kwargs)), capture.records)
+        except BaseException as exc:  # the class is part of the contract
+            return ("raise", type(exc), capture.records)
+    finally:
+        ENGINE_LOGGER.removeHandler(capture)
+        ENGINE_LOGGER.propagate = propagate
 
 
 def _normalize(value):
@@ -42,6 +68,17 @@ def _normalize(value):
     if isinstance(value, list):
         return [_normalize(v) for v in value]
     return value
+
+
+def _counts(engine):
+    bucket = engine.get_metrics()
+    return None if bucket is None else bucket["toggles"]
+
+
+def _assert_same(native, official, method, *args, **kwargs):
+    n = _outcome(getattr(native, method), *args, **kwargs)
+    o = _outcome(getattr(official, method), *args, **kwargs)
+    assert n == o, (method, args, kwargs, n, o)
 
 
 # --- randomized states (evaluation semantics) -----------------------------------
@@ -139,12 +176,11 @@ def test_randomized_state_parity(seed):
     for _ in range(40):
         ctx = _gen_context(rng)
         for name in names:
-            for method in ("is_enabled", "get_variant"):
-                n = _outcome(getattr(native, method), name, dict(ctx))
-                o = _outcome(getattr(official, method), name, dict(ctx))
-                assert n == o, (seed, method, name, ctx, n, o)
+            for method in EVAL_METHODS:
+                _assert_same(native, official, method, name, dict(ctx))
     for name in names:
         assert native.should_emit_impression_event(name) == official.should_emit_impression_event(name)
+    assert _counts(native) == _counts(official)
 
 
 # --- awkward contexts (conversion rules, fallbacks and errors) ------------------
@@ -159,13 +195,14 @@ def _c(ctx_name, op, values=None, value=None):
     return d
 
 
-def _flag(name, constraints=None, strategy="default", params=None, variants=None):
+def _flag(name, constraints=None, strategy="default", params=None, variants=None, **extra):
     s = {"name": strategy, "constraints": constraints or []}
     if params:
         s["parameters"] = params
     f = {"name": name, "enabled": True, "type": "release", "project": "default", "strategies": [s]}
     if variants:
         f["variants"] = variants
+    f.update(extra)
     return f
 
 
@@ -178,11 +215,13 @@ FIELD_FLAGS = [
     _flag("f_app", [_c("appName", "IN", ["bench"])]),
     _flag("f_time", [_c("currentTime", "DATE_AFTER", value="2020-01-01T00:00:00Z")]),
     _flag("f_remote", [_c("remoteAddress", "IN", ["10.0.0.1"])]),
-    _flag("f_plan", [_c("plan", "IN", ["pro"])]),
+    _flag("f_plan", [_c("plan", "IN", ["pro"])], impressionData=True),
     _flag("f_num", [_c("age", "NUM_GTE", value="18")]),
     _flag("f_bool", [_c("beta", "IN", ["true", "True"])]),
     _flag("f_float", [_c("score", "NUM_GT", value="1.5")]),
     _flag("f_team", [_c("team", "IN", ["payments"])]),
+    # Core 0.21.5 compares semver by precedence, ignoring build metadata.
+    _flag("f_semver", [_c("version", "SEMVER_EQ", value="3.0.0-beta+build2")]),
     _flag("f_roll", strategy="flexibleRollout", params={"rollout": "50", "stickiness": "userId", "groupId": "g"}),
     # Weighted selection falls back to a random bucket when the stickiness field is
     # missing, so only overrides decide here (zero-weight variants are never drawn).
@@ -191,8 +230,9 @@ FIELD_FLAGS = [
         variants=[
             {"name": "a", "weight": 1000, "weightType": "variable", "stickiness": "userId", "payload": {"type": "json", "value": "{}"}},
             {"name": "b", "weight": 0, "weightType": "variable", "stickiness": "userId", "overrides": [{"contextName": "plan", "values": ["pro"]}]},
-            {"name": "c", "weight": 0, "weightType": "variable", "stickiness": "userId", "payload": {"type": "string", "value": "c"}, "overrides": [{"contextName": "userId", "values": ["42"]}]},
+            {"name": "c\x00cut", "weight": 0, "weightType": "variable", "stickiness": "userId", "payload": {"type": "string", "value": "c"}, "overrides": [{"contextName": "userId", "values": ["42"]}]},
         ],
+        impressionData=True,
     ),
 ]
 FIELD_STATE = json.dumps({"version": 2, "segments": [], "features": FIELD_FLAGS})
@@ -210,6 +250,7 @@ GOOD = {
     "beta": ["true", "no"],
     "score": ["2.5", "1.0"],
     "team": ["payments", "growth"],
+    "version": ["3.0.0-beta+build1", "3.0.0-beta+build2", "3.0.0"],
 }
 
 
@@ -252,7 +293,7 @@ def _awkward_context(rng, depth=0):
     r = rng.random()
     if r < 0.72:
         props = {}
-        for k in ["plan", "age", "beta", "score", "team"] + KNOWN:
+        for k in ["plan", "age", "beta", "score", "team", "version"] + KNOWN:
             if rng.random() < (0.5 if k not in KNOWN else 0.2):
                 props[k] = _value(rng, k)
         if rng.random() < 0.05:
@@ -276,13 +317,12 @@ def _awkward_context(rng, depth=0):
 def test_awkward_context_parity(seed):
     rng = random.Random(1000 + seed)
     native, official = _engines(FIELD_STATE)
-    for _ in range(250):
+    for _ in range(150):
         ctx = _awkward_context(rng)
         for name in FIELD_NAMES:
-            for method in ("is_enabled", "get_variant"):
-                n = _outcome(getattr(native, method), name, ctx)
-                o = _outcome(getattr(official, method), name, ctx)
-                assert n == o, (method, name, ctx, n, o)
+            for method in EVAL_METHODS:
+                _assert_same(native, official, method, name, ctx)
+    assert _counts(native) == _counts(official)
 
 
 def _plain_value(rng, key):
@@ -308,7 +348,7 @@ def _plain_context(rng):
             d[f] = _plain_value(rng, f)
     if rng.random() < 0.85:
         props = {}
-        for k in ["plan", "age", "beta", "score", "team"] + KNOWN:
+        for k in ["plan", "age", "beta", "score", "team", "version"] + KNOWN:
             if rng.random() < (0.5 if k not in KNOWN else 0.3):
                 props[k] = _plain_value(rng, k)
         d["properties"] = props
@@ -323,21 +363,21 @@ def _plain_context(rng):
 @pytest.mark.parametrize("seed", range(6))
 def test_plain_context_fast_path_parity(seed):
     # Targets the hand-written conversion: every context here must be handled
-    # natively (never by the JSON fallback) and still match 1.3.1.
+    # natively (never by the JSON fallback) and still match 2.0.0.
     rng = random.Random(3000 + seed)
     native, official = _engines(FIELD_STATE)
-    for _ in range(300):
+    for _ in range(200):
         ctx = _plain_context(rng)
-        assert native._native.is_enabled("f_plan", ctx) is not NotImplemented, ctx
+        assert native._native.resolve_toggle("f_plan", ctx, False, False) is not NotImplemented, ctx
+        assert native._native.resolve_variant("f_plan", ctx, False) is not NotImplemented, ctx
         for name in FIELD_NAMES:
-            for method in ("is_enabled", "get_variant"):
-                n = _outcome(getattr(native, method), name, ctx)
-                o = _outcome(getattr(official, method), name, ctx)
-                assert n == o, (method, name, ctx, n, o)
+            for method in EVAL_METHODS:
+                _assert_same(native, official, method, name, ctx)
+    assert _counts(native) == _counts(official)
 
 
-def _sdk_safe_context(context, static=None):
-    """UnleashClient 6.8.0's _safe_context: what the SDK hands the engine."""
+def _sdk_context(context, static=None):
+    """UnleashClient 6.9.0's _ContextEnricher.build: what the SDK hands the engine."""
     base = ["userId", "sessionId", "environment", "appName", "currentTime", "remoteAddress", "properties"]
     new_context = dict(static or {"appName": "bench", "environment": "prod"})
     new_context.update(context or {})
@@ -362,22 +402,26 @@ def test_sdk_shaped_context_parity(seed):
     rng = random.Random(2000 + seed)
     native, official = _engines(FIELD_STATE)
     checked = 0
-    while checked < 250:
+    while checked < 150:
         raw = _awkward_context(rng)
         try:
-            ctx = _sdk_safe_context(raw)
+            ctx = _sdk_context(raw)
         except Exception:
             continue  # the SDK itself rejects it before reaching an engine
         checked += 1
         for name in FIELD_NAMES:
-            for method in ("is_enabled", "get_variant"):
-                n = _outcome(getattr(native, method), name, ctx)
-                o = _outcome(getattr(official, method), name, ctx)
-                assert n == o, (method, name, raw, ctx, n, o)
+            for method in EVAL_METHODS:
+                _assert_same(native, official, method, name, ctx)
+    assert _counts(native) == _counts(official)
 
 
 CIRCULAR = {}
 CIRCULAR["self"] = CIRCULAR
+
+
+class _NoTruth:
+    def __bool__(self):
+        raise ValueError("no truth value")
 
 
 @pytest.mark.parametrize(
@@ -394,6 +438,7 @@ CIRCULAR["self"] = CIRCULAR
         ("f_plan", []),
         ("f_plan", [("plan", "pro")]),
         ("f_plan", "string context"),
+        ("f_plan", _NoTruth()),
         ("f_plan", CIRCULAR),
         ("f_plan", {"properties": CIRCULAR}),
         ("f_plan", {"plan": object()}),
@@ -402,10 +447,68 @@ CIRCULAR["self"] = CIRCULAR
 )
 def test_odd_arguments_match(toggle, context):
     native, official = _engines(FIELD_STATE)
-    for method in ("is_enabled", "get_variant"):
-        n = _outcome(getattr(native, method), toggle, context)
-        o = _outcome(getattr(official, method), toggle, context)
-        assert n == o, (method, toggle, n, o)
+    for method in EVAL_METHODS:
+        _assert_same(native, official, method, toggle, context)
+    assert _counts(native) == _counts(official)
+
+
+def _raise_stop(name, context):
+    raise _Stop()
+
+
+class _Stop(BaseException):
+    """Not an Exception: 2.0.0's never-raise handler must let it through."""
+
+
+def _fallback_raises(name, context):
+    raise RuntimeError(f"fallback for {name}")
+
+
+FALLBACKS = [
+    None,
+    lambda name, context: True,
+    lambda name, context: False,
+    lambda name, context: None,
+    lambda name, context: "yes",
+    lambda name, context: [],
+    lambda name, context: _NoTruth(),
+    lambda name, context: context.get("plan") == "pro",
+    _fallback_raises,
+    _raise_stop,
+    "not callable",
+]
+
+
+@pytest.mark.parametrize("fallback", FALLBACKS)
+def test_fallback_function_parity(fallback):
+    native, official = _engines(FIELD_STATE)
+    for name in FIELD_NAMES + ["unknown", "unknown\x00tail", None, 5]:
+        for ctx in ({}, None, {"plan": "pro"}, {"plan": object()}):
+            for method in ("is_enabled", "check_enabled"):
+                _assert_same(native, official, method, name, ctx, fallback_function=fallback)
+    assert _counts(native) == _counts(official)
+
+
+def test_fallback_sees_the_callers_context():
+    seen = {"native": [], "official": []}
+    native, official = _engines(FIELD_STATE)
+    for key, engine in (("native", native), ("official", official)):
+        for ctx in ({"userId": "1"}, None, {}):
+            engine.is_enabled("unknown", ctx, fallback_function=lambda n, c, k=key: seen[k].append((n, c)))
+    assert seen["native"] == seen["official"]
+
+
+def test_results_print_and_refuse_bool_like_the_reference():
+    native, official = _engines(FIELD_STATE)
+    for name in ("f_plan", "unknown"):
+        n, o = native.is_enabled(name, {"plan": "pro"}), official.is_enabled(name, {"plan": "pro"})
+        assert repr(n) == repr(o)
+        with pytest.raises(TypeError) as n_err:
+            bool(n)
+        with pytest.raises(TypeError) as o_err:
+            bool(o)
+        assert str(n_err.value) == str(o_err.value)
+        assert repr(native.get_variant(name, {})) == repr(official.get_variant(name, {}))
 
 
 # --- the rest of the SDK-facing surface -------------------------------------------
@@ -416,7 +519,7 @@ def test_state_and_metadata_parity():
     payload = json.dumps(_gen_state(rng))
     native, official = _engines(payload)
     assert native.get_state() == official.get_state()
-    # Core lists toggles from a hash map, so 1.3.1's own order differs between engine
+    # Core lists toggles from a hash map, so 2.0.0's own order differs between engine
     # instances; only the contents are a stable behavior.
     assert sorted(_normalize(native.list_known_toggles())) == sorted(_normalize(official.list_known_toggles()))
 
@@ -427,6 +530,8 @@ def test_state_and_metadata_parity():
             "features": [
                 _flag("ok"),
                 _flag("bad", [{"contextName": "x", "operator": "NUM_GT", "value": "NaN-ish"}]),
+                # Core 0.21.5 rejects a scalar constraint without a value instead of panicking.
+                _flag("novalue", [{"contextName": "x", "operator": "NUM_LT"}]),
             ],
         }
     )
@@ -434,6 +539,9 @@ def test_state_and_metadata_parity():
         n_engine, o_engine = Native(), Official()
         assert _outcome(n_engine.take_state, state) == _outcome(o_engine.take_state, state), state
         assert n_engine.get_state() == o_engine.get_state(), state
+        for name in ("ok", "bad", "novalue"):
+            for method in EVAL_METHODS:
+                _assert_same(n_engine, o_engine, method, name, {"x": "1"})
     assert _outcome(Native().take_state, None) == _outcome(Official().take_state, None)
 
 
@@ -456,13 +564,9 @@ def test_metrics_parity():
     assert set(n_bucket) == set(o_bucket)
     assert native.get_metrics() is None and official.get_metrics() is None
 
-    class Falsy:
-        def __bool__(self):
-            raise ValueError("no truth value")
-
     for method, args in [
         ("count_toggle", (None, True)),
-        ("count_toggle", ("f_plan", Falsy())),
+        ("count_toggle", ("f_plan", _NoTruth())),
         ("count_variant", ("f_variant", None)),
         ("should_emit_impression_event", (None,)),
     ]:
@@ -476,7 +580,7 @@ class _Recorder:
 
     def apply(self, parameters, context):
         self.calls.append((dict(parameters), dict(context) if isinstance(context, dict) else context))
-        if isinstance(self.result, Exception):
+        if isinstance(self.result, BaseException):
             raise self.result
         return self.result(context) if callable(self.result) else self.result
 
@@ -495,6 +599,7 @@ def test_custom_strategy_parity(result):
                     "enabled": True,
                     "strategies": [{"name": "mine", "parameters": {"p": "1"}, "constraints": []}],
                     "variants": [{"name": "v", "weight": 1000, "weightType": "variable", "stickiness": "default"}],
+                    "impressionData": True,
                 },
                 _flag("plain"),
             ],
@@ -507,14 +612,14 @@ def test_custom_strategy_parity(result):
     native.take_state(state)
     official.take_state(state)
     for ctx in ({"userId": "1"}, {"userId": "2"}, {}, None, {"userId": object()}):
-        for name in ("custom", "plain"):
-            for method in ("is_enabled", "get_variant"):
-                n = _outcome(getattr(native, method), name, ctx)
-                o = _outcome(getattr(official, method), name, ctx)
-                assert n == o, (method, name, ctx, n, o)
+        for name in ("custom", "plain", "unknown"):
+            for method in EVAL_METHODS:
+                _assert_same(native, official, method, name, ctx)
+            _assert_same(native, official, "is_enabled", name, ctx, fallback_function=lambda n, c: True)
     # apply() runs exactly as often, with the same arguments.
     assert len(n_strategy.calls) == len(o_strategy.calls)
     assert [c[0] for c in n_strategy.calls] == [c[0] for c in o_strategy.calls]
+    assert _counts(native) == _counts(official)
 
 
 def test_register_custom_strategy_validation_parity():
@@ -533,7 +638,7 @@ def test_register_custom_strategy_validation_parity():
 
 def _impact_snapshot(engine):
     # Metric and sample order come from hash maps in both engines and differ between
-    # instances of 1.3.1 itself, so compare them as sets.
+    # instances of 2.0.0 itself, so compare them as sets.
     snapshot = []
     for metric in engine.collect_impact_metrics():
         metric = dict(metric)

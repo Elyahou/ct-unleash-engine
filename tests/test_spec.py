@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ct_unleash_engine import UnleashEngine, Variant
+from ct_unleash_engine import UnleashEngine
 
 
 def _spec_dir():
@@ -64,16 +64,12 @@ def test_client_specification(name, kind, state, test):
     engine.take_state(state)
     context = test.get("context") or {}
     if kind == "enabled":
+        # An unknown toggle comes back disabled, which is what the spec expects.
         result = engine.is_enabled(test["toggleName"], context)
-        # The spec treats an unknown toggle's expected value as False; the
-        # engine returns None there (the SDK's fallback signal).
-        assert (result or False) == test["expectedResult"]
+        assert result.is_enabled == test["expectedResult"]
     else:
         expected = test["expectedResult"]
-        v = engine.get_variant(test["toggleName"], context)
-        if v is None:
-            # 1.3.1 returns None when there is no variant; the SDK substitutes this.
-            v = Variant(name="disabled", payload=None, enabled=False, feature_enabled=False)
+        v = engine.get_variant(test["toggleName"], context).variant
         assert v.name == expected["name"]
         assert v.enabled == expected["enabled"]
         if "feature_enabled" in expected:

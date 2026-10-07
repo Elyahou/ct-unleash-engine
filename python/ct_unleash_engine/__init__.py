@@ -1,21 +1,31 @@
-"""Drop-in replacement for yggdrasil-engine 1.3.1's ``UnleashEngine``: same results,
-return types and exceptions, backed by a PyO3 binding to the same yggdrasil core.
+"""Drop-in replacement for yggdrasil-engine 2.0.0's ``UnleashEngine``: same results,
+return types, exceptions and log records, backed by a PyO3 binding to the same
+yggdrasil core.
 
 Plain contexts (an exact ``dict`` of ``str`` keys whose values are str, None, bool
 or 64-bit ints, which is what the Unleash SDK always passes) are read directly in
-Rust with no JSON. Anything else replays 1.3.1's exact steps: ``json.dumps`` here,
-then the native ``*_json`` methods, which parse with the same serde types and
-versions as 1.3.1's native library. That fallback is what keeps odd inputs
-identical, so it must not be "simplified" into the fast path.
+Rust with no JSON, and one native call evaluates, looks up impression data and
+counts. Anything else replays 2.0.0's exact steps: ``json.dumps`` here, then the
+native ``*_json`` methods, which parse with the same serde types and versions as
+2.0.0's native library. That fallback is what keeps odd inputs identical, so it
+must not be "simplified" into the fast path.
 """
 
 from __future__ import annotations
 
 import ctypes
 import json
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Callable, Dict, List, Optional
 
+from ._models import (
+    FeatureDefinition,
+    FeatureToggle,
+    FeatureVariant,
+    Variant,
+    disabled_variant,
+    load_feature_defs,
+)
 from ._native import NativeEngine, __core_version__, _set_error_class
 from .custom_strategy import CustomStrategyHandler
 
@@ -32,63 +42,31 @@ except ImportError:  # pragma: no cover - only without yggdrasil-engine installe
 
 _set_error_class(YggdrasilError)
 
-# The value yggdrasil-engine 1.3.1 exposes (its bundled native library version),
-# which the SDK reports to the Unleash server as "yggdrasilVersion". Kept identical
-# so registration and metrics payloads don't change when swapping engines.
-__yggdrasil_core_version__ = "0.20.7"
+# 2.0.0 logs evaluation failures on its own module logger. Logging under the same
+# name keeps existing logging configuration (levels, handlers, filters) in effect
+# when swapping engines.
+_logger = logging.getLogger("yggdrasil_engine.engine")
+
+# The value yggdrasil-engine 2.0.0 exposes (its bundled native library version),
+# which the SDK reports to the Unleash server as "yggdrasilVersion".
+__yggdrasil_core_version__ = "0.20.8"
 
 __all__ = [
     "FeatureDefinition",
+    "FeatureToggle",
+    "FeatureVariant",
     "UnleashEngine",
     "Variant",
     "YggdrasilError",
     "__core_version__",
     "__yggdrasil_core_version__",
+    "disabled_variant",
     "load_feature_defs",
 ]
 
 
-@dataclass
-class Variant:
-    """Same fields, order and defaults as 1.3.1: the SDK returns
-    ``asdict(variant)`` to callers, so field order shows up in their dicts."""
-
-    name: str
-    payload: Optional[Dict[str, str]] = field(default_factory=dict)
-    enabled: bool = False
-    feature_enabled: bool = False
-
-    @staticmethod
-    def from_dict(data: dict) -> "Variant":
-        return Variant(
-            name=data.get("name", ""),
-            payload=data.get("payload"),
-            enabled=data.get("enabled", False),
-            feature_enabled=data.get("featureEnabled", False),
-        )
-
-
-@dataclass
-class FeatureDefinition:
-    name: str
-    project: str
-    type: Optional[str]
-
-    @staticmethod
-    def from_dict(data: dict) -> "FeatureDefinition":
-        return FeatureDefinition(
-            name=data.get("name", ""),
-            project=data.get("project", ""),
-            type=data.get("type"),
-        )
-
-
-def load_feature_defs(raw_defs: List[dict]) -> List[FeatureDefinition]:
-    return [FeatureDefinition.from_dict(defn) for defn in raw_defs]
-
-
 def _c_bytes(value: Any) -> Optional[bytes]:
-    """What 1.3.1 hands ctypes for a string argument: ``value.encode("utf-8")``,
+    """What 2.0.0 hands ctypes for a string argument: ``value.encode("utf-8")``,
     raising whatever that raises, then accepted by ``c_char_p`` only as bytes or
     None (None becomes a NULL pointer, which the native side reports as an error)."""
     raw = value.encode("utf-8")
@@ -109,11 +87,11 @@ def _c_number(ctype: Any, value: Any, position: int) -> Any:
         ) from None
 
 
-def _variant(raw: Any) -> Optional[Variant]:
+def _to_variant(raw: Any) -> Optional[Variant]:
     if raw is None:
         return None
     name, payload_type, payload_value, enabled, feature_enabled = raw
-    # 1.3.1 builds this with Variant.from_dict on the native JSON, which omits
+    # 2.0.0 builds this with Variant.from_dict on the native JSON, which omits
     # "payload" when there is none.
     payload = (
         None
@@ -132,51 +110,193 @@ class UnleashEngine:
         self._native = NativeEngine()
         self.custom_strategy_handler = CustomStrategyHandler()
         # Bound once: these run on every flag check.
-        self._fast_is_enabled = self._native.is_enabled
-        self._fast_get_variant = self._native.get_variant
-        self._fast_count_toggle = self._native.count_toggle
+        self._resolve_toggle = self._native.resolve_toggle
+        self._resolve_variant = self._native.resolve_variant
 
     # --- state -------------------------------------------------------------
 
     def take_state(self, state_json: str) -> None:
         self._native.take_state(_c_bytes(state_json))
         self.custom_strategy_handler.update_strategies(state_json)
-        # 1.3.1 returns None in every case: its native call reports warnings as an
-        # error status and the Python side never reads it. Returning warnings here
-        # would make the SDK log a warning the reference engine never triggers.
+        # 2.0.0 returns the native result's value, which is always empty (see the
+        # native take_state), so it returns None in every case. Returning warnings
+        # here would make the SDK log warnings the reference engine never reports.
         return None
 
     def get_state(self) -> str:
         raw = self._native.get_state()
-        # 1.3.1 re-serialises the native JSON with json.dumps; the SDK writes this
+        # 2.0.0 re-serialises the native JSON with json.dumps; the SDK writes this
         # string to its cache, so the formatting has to match too.
         return json.dumps(json.loads(raw) if raw is not None else None)
 
     # --- evaluation (hot path) ----------------------------------------------
+    #
+    # Like 2.0.0, these never raise: any failure yields the disabled answer and a
+    # warning, with the exception attached, on the ``yggdrasil_engine.engine`` logger.
 
-    def is_enabled(self, toggle_name: str, context: dict) -> Optional[bool]:
+    def is_enabled(
+        self,
+        toggle_name: str,
+        context: dict,
+        *,
+        fallback_function: Optional[Callable[[str, dict], Any]] = None,
+    ) -> FeatureToggle:
+        """Evaluate a toggle and count the answer towards ``get_metrics()``."""
+        try:
+            return self._evaluate_toggle(toggle_name, context, fallback_function, True)
+        except Exception:
+            result = FeatureToggle(name=toggle_name)
+            _logger.warning(
+                "Failed to evaluate toggle %s, returning %s",
+                toggle_name,
+                result,
+                exc_info=True,
+            )
+            return result
+
+    def check_enabled(
+        self,
+        toggle_name: str,
+        context: dict,
+        *,
+        fallback_function: Optional[Callable[[str, dict], Any]] = None,
+    ) -> FeatureToggle:
+        """Evaluate a toggle without counting it."""
+        try:
+            return self._evaluate_toggle(toggle_name, context, fallback_function, False)
+        except Exception:
+            result = FeatureToggle(name=toggle_name)
+            _logger.warning(
+                "Failed to evaluate toggle %s, returning %s",
+                toggle_name,
+                result,
+                exc_info=True,
+            )
+            return result
+
+    def get_variant(self, toggle_name: str, context: dict) -> FeatureVariant:
+        """Resolve a toggle's variant and count the toggle and the variant."""
+        try:
+            return self._evaluate_variant(toggle_name, context, True)
+        except Exception:
+            result = FeatureVariant(
+                name=toggle_name,
+                variant=disabled_variant(),
+                is_found=False,
+                requires_impression_event_emission=False,
+            )
+            _logger.warning(
+                "Failed to evaluate variant for toggle %s, returning %s",
+                toggle_name,
+                result,
+                exc_info=True,
+            )
+            return result
+
+    def check_variant(self, toggle_name: str, context: dict) -> FeatureVariant:
+        """Resolve a toggle's variant without counting anything."""
+        try:
+            return self._evaluate_variant(toggle_name, context, False)
+        except Exception:
+            result = FeatureVariant(
+                name=toggle_name,
+                variant=disabled_variant(),
+                is_found=False,
+                requires_impression_event_emission=False,
+            )
+            _logger.warning(
+                "Failed to evaluate variant for toggle %s, returning %s",
+                toggle_name,
+                result,
+                exc_info=True,
+            )
+            return result
+
+    # 2.0.0's steps, in its order: evaluate (``context or {}`` first), consult the
+    # fallback for an unknown toggle, look up impression data, then count. The
+    # native fast path does all of it in one call; everything it declines takes
+    # 2.0.0's own route below. Toggles with custom strategies always take that route,
+    # because 2.0.0 serialises the context before calling a strategy's apply(),
+    # which may mutate it, and only then evaluates.
+
+    def _evaluate_toggle(
+        self,
+        toggle_name: Any,
+        context: Any,
+        fallback_function: Optional[Callable[[str, dict], Any]],
+        count: bool,
+    ) -> FeatureToggle:
         ctx = context or {}
         definitions = self.custom_strategy_handler.strategy_definitions
-        if definitions and type(toggle_name) is str and toggle_name in definitions:
-            return self._is_enabled_exact(toggle_name, context, ctx)
-        result = self._fast_is_enabled(toggle_name, ctx)
-        if result is NotImplemented:
-            return self._is_enabled_exact(toggle_name, context, ctx)
+        if not (definitions and type(toggle_name) is str and toggle_name in definitions):
+            resolved = self._resolve_toggle(
+                toggle_name, ctx, count, fallback_function is not None
+            )
+            if resolved is None:
+                # Unknown toggle: the fallback answers before anything is looked up
+                # or counted.
+                value = fallback_function(toggle_name, context)  # type: ignore[misc]
+                return self._finish_toggle(toggle_name, value, False, count)
+            if resolved is not NotImplemented:
+                is_enabled, is_found, impression = resolved
+                return FeatureToggle(
+                    name=toggle_name,
+                    is_enabled=is_enabled,
+                    is_found=is_found,
+                    requires_impression_event_emission=impression,
+                )
+        value = self._is_enabled_exact(toggle_name, context, ctx)
+        is_found = value is not None
+        if value is None and fallback_function is not None:
+            value = fallback_function(toggle_name, context)
+        return self._finish_toggle(toggle_name, value, is_found, count)
+
+    def _finish_toggle(
+        self, toggle_name: Any, value: Any, is_found: bool, count: bool
+    ) -> FeatureToggle:
+        is_enabled = bool(value)
+        result = FeatureToggle(
+            name=toggle_name,
+            is_enabled=is_enabled,
+            is_found=is_found,
+            requires_impression_event_emission=bool(
+                self.should_emit_impression_event(toggle_name)
+            ),
+        )
+        if count:
+            self.count_toggle(toggle_name, is_enabled)
         return result
 
-    def get_variant(self, toggle_name: str, context: dict) -> Optional[Variant]:
+    def _evaluate_variant(
+        self, toggle_name: Any, context: Any, count: bool
+    ) -> FeatureVariant:
         ctx = context or {}
         definitions = self.custom_strategy_handler.strategy_definitions
-        if definitions and type(toggle_name) is str and toggle_name in definitions:
-            return _variant(self._get_variant_exact(toggle_name, context, ctx))
-        raw = self._fast_get_variant(toggle_name, ctx)
-        if raw is NotImplemented:
-            raw = self._get_variant_exact(toggle_name, context, ctx)
-        return _variant(raw)
-
-    # 1.3.1's own steps, in its order. Toggles with custom strategies always come
-    # here: 1.3.1 serialises the context before calling a strategy's apply(), which
-    # may mutate it, and only then evaluates.
+        if not (definitions and type(toggle_name) is str and toggle_name in definitions):
+            resolved = self._resolve_variant(toggle_name, ctx, count)
+            if resolved is not NotImplemented:
+                raw, impression = resolved
+                value = _to_variant(raw)
+                return FeatureVariant(
+                    name=toggle_name,
+                    variant=value if value is not None else disabled_variant(),
+                    is_found=value is not None,
+                    requires_impression_event_emission=impression,
+                )
+        value = _to_variant(self._get_variant_exact(toggle_name, context, ctx))
+        variant = value if value is not None else disabled_variant()
+        result = FeatureVariant(
+            name=toggle_name,
+            variant=variant,
+            is_found=value is not None,
+            requires_impression_event_emission=bool(
+                self.should_emit_impression_event(toggle_name)
+            ),
+        )
+        if count:
+            self.count_toggle(toggle_name, variant.feature_enabled)
+            self.count_variant(toggle_name, variant.name)
+        return result
 
     def _is_enabled_exact(self, toggle_name: Any, context: Any, ctx: Any) -> Optional[bool]:
         serialized_context = json.dumps(ctx)
@@ -206,7 +326,7 @@ class UnleashEngine:
     # --- metrics -------------------------------------------------------------
 
     def count_toggle(self, toggle_name: str, enabled: bool) -> None:
-        if self._fast_count_toggle(toggle_name, enabled) is NotImplemented:
+        if self._native.count_toggle(toggle_name, enabled) is NotImplemented:
             self._native.count_toggle_bytes(_c_bytes(toggle_name), enabled)
 
     def count_variant(self, toggle_name: str, variant_name: str) -> None:
@@ -230,7 +350,7 @@ class UnleashEngine:
     def list_known_toggles(self) -> List[FeatureDefinition]:
         return load_feature_defs(json.loads(self._native.list_known_toggles()))
 
-    # --- impact metrics (argument handling mirrors 1.3.1 line by line) --------
+    # --- impact metrics (argument handling mirrors 2.0.0 line by line) --------
 
     def define_counter(self, name: str, help_text: str) -> None:
         self._native.define_counter(_c_bytes(name), _c_bytes(help_text))

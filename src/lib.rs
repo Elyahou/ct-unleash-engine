@@ -1,15 +1,17 @@
-//! PyO3 binding to yggdrasil-core that behaves exactly like yggdrasil-engine 1.3.1
-//! (native library 0.20.7, core 0.21.3), only faster.
+//! PyO3 binding to yggdrasil-core that behaves exactly like yggdrasil-engine 2.0.0
+//! (native library 0.20.8, core 0.21.5), only faster.
 //!
-//! The hot path (`is_enabled`, `get_variant`) reads a *plain* context straight from
-//! the Python dict: an exact `dict` with exact `str` keys, whose values are `str`,
-//! `None`, `bool` or an `int` that fits in 64 bits, and whose `properties` (if any)
-//! has the same shape. Those values come out of 1.3.1's `json.dumps` + serde round
-//! trip unchanged, so applying unleash-types' `Context::from_map` rules to them
-//! directly yields the same context the reference engine evaluates.
+//! The hot path (`resolve_toggle`, `resolve_variant`) reads a *plain* context
+//! straight from the Python dict: an exact `dict` with exact `str` keys, whose values
+//! are `str`, `None`, `bool` or an `int` that fits in 64 bits, and whose `properties`
+//! (if any) has the same shape. Those values come out of 2.0.0's `json.dumps` + serde
+//! round trip unchanged, so applying unleash-types' `Context::from_map` rules to them
+//! directly yields the same context the reference engine evaluates. Each hot-path
+//! call also does the impression lookup and the counting that 2.0.0 makes as separate
+//! native calls, so one crossing answers a whole `is_enabled` or `get_variant`.
 //!
 //! Anything else makes the fast methods return `NotImplemented`, and the Python
-//! layer replays 1.3.1's exact steps instead: `json.dumps` in Python, then the
+//! layer replays 2.0.0's exact steps instead: `json.dumps` in Python, then the
 //! `*_json` / `*_bytes` methods below, which do what the native library does with
 //! the same serde types and the same C-string handling. Exotic input (floats,
 //! containers, dict or key subclasses, non-str keys, a nested `context` key, strings
@@ -47,7 +49,7 @@ const CONTEXT_FIELDS: [&str; 6] = [
     "remoteAddress",
 ];
 
-/// The class 1.3.1 raises for native errors (`yggdrasil_engine.engine.YggdrasilError`
+/// The class 2.0.0 raises for native errors (`yggdrasil_engine.engine.YggdrasilError`
 /// whenever that package is importable). Registered once from Python at import time.
 static ERROR_CLASS: GILOnceCell<Py<PyType>> = GILOnceCell::new();
 
@@ -116,7 +118,7 @@ fn until_nul(s: Cow<'_, str>) -> Cow<'_, str> {
 
 /// A toggle/variant name as the native library receives it, or `None` when the
 /// Python slow path must produce it (not an exact `str`, or not UTF-8 encodable),
-/// so that `.encode("utf-8")` raises exactly what 1.3.1 raises.
+/// so that `.encode("utf-8")` raises exactly what 2.0.0 raises.
 fn fast_name<'a>(name: &'a Bound<'_, PyAny>) -> Option<Cow<'a, str>> {
     let name = name.downcast_exact::<PyString>().ok()?;
     name.to_cow().ok().map(until_nul)
@@ -141,7 +143,7 @@ fn c_bool(py: Python<'_>, value: &Bound<'_, PyAny>, position: usize) -> PyResult
 /// The context is outside the fast path's shape; the caller must take the exact path.
 struct NotPlain;
 
-/// A plain value after 1.3.1's `json.dumps` + unleash-types' `parse_value`:
+/// A plain value after 2.0.0's `json.dumps` + unleash-types' `parse_value`:
 /// strings stay as they are, `None` is dropped, bools and 64-bit ints are stringified.
 fn plain_value<'a>(value: &'a Bound<'_, PyAny>) -> Result<Option<Cow<'a, str>>, NotPlain> {
     if let Ok(s) = value.downcast::<PyString>() {
@@ -281,7 +283,7 @@ fn variant_response(
 }
 
 /// `(name, payload_type, payload_value, enabled, feature_enabled)`, or `None` when
-/// the engine has no variant (1.3.1 returns `None` to the SDK then).
+/// the toggle is unknown (2.0.0 substitutes the disabled variant then).
 fn variant_to_py(py: Python<'_>, variant: Option<ExtendedVariantDef>) -> PyObject {
     match variant {
         None => py.None(),
@@ -315,6 +317,26 @@ impl NativeEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// The native `should_emit_impression_event`: an error here raises.
+    fn impression(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        guard(|| Ok(self.lock().should_emit_impression_event(name))).map_err(|e| raise(py, e))
+    }
+
+    /// 2.0.0 frees the native count responses unread, so a failed count is ignored.
+    fn count_toggle_quietly(&self, name: &str, enabled: bool) {
+        let _ = guard(|| {
+            self.lock().count_toggle(name, enabled);
+            Ok(())
+        });
+    }
+
+    fn count_variant_quietly(&self, name: &str, variant: &str) {
+        let _ = guard(|| {
+            self.lock().count_variant(name, variant);
+            Ok(())
+        });
+    }
 }
 
 #[pymethods]
@@ -328,9 +350,10 @@ impl NativeEngine {
 
     // --- state ------------------------------------------------------------------
 
-    /// 1.3.1 never surfaces the native result here: a payload that fails to parse
-    /// leaves the state untouched, and warnings come back as an error status the
-    /// Python side does not check. Ignoring both is deliberate.
+    /// 2.0.0 reads only the value of the native result here, and that value is
+    /// always empty: a payload that fails to parse leaves the state untouched, and
+    /// warnings come back as an error status, neither of which 2.0.0 checks. Ignoring
+    /// both is deliberate.
     #[pyo3(signature = (json))]
     fn take_state(&self, json: Option<&[u8]>) {
         let _ = guard(|| {
@@ -342,7 +365,7 @@ impl NativeEngine {
     }
 
     /// Client-features JSON; the Python layer re-serialises it with `json.dumps`
-    /// exactly like 1.3.1. `None` where 1.3.1 would see an error response.
+    /// exactly like 2.0.0. `None` where 2.0.0 would see an error response.
     fn get_state(&self) -> Option<String> {
         guard(|| Ok(serde_json::to_string(&self.lock().get_state()).ok()))
             .ok()
@@ -351,20 +374,30 @@ impl NativeEngine {
 
     // --- evaluation, fast path ---------------------------------------------------
 
-    /// `True` / `False` / `None` (unknown toggle), or `NotImplemented` when the
-    /// name or context is outside the fast path.
-    fn is_enabled(
+    /// 2.0.0's `is_enabled` / `check_enabled` steps for a plain context, in one call:
+    /// evaluate, ask whether an impression event is due, then count the answer when
+    /// `count` is set. Each step keeps the native library's error handling: a failed
+    /// evaluation or impression lookup raises, a failed count is ignored.
+    ///
+    /// Returns `NotImplemented` when the name or context is outside the fast path, and
+    /// `None` when the toggle is unknown and the caller holds a fallback function:
+    /// 2.0.0 consults it before the lookup and the count, so neither happens here.
+    /// Otherwise `(is_enabled, is_found, requires_impression_event_emission)`.
+    #[pyo3(signature = (name, context, count, has_fallback))]
+    fn resolve_toggle(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         context: &Bound<'_, PyAny>,
+        count: bool,
+        has_fallback: bool,
     ) -> PyResult<PyObject> {
         let (Some(name), Ok(context)) = (fast_name(name), context.downcast_exact::<PyDict>())
         else {
             return Ok(py.NotImplemented());
         };
         let no_custom_results = HashMap::new();
-        let outcome = guard(|| {
+        let evaluation = guard(|| {
             Ok(with_plain_context(
                 context,
                 &name,
@@ -372,26 +405,44 @@ impl NativeEngine {
                 |enriched| self.lock().check_enabled(enriched),
             ))
         });
-        match outcome {
-            Ok(Ok(enabled)) => Ok(enabled.into_py(py)),
-            Ok(Err(NotPlain)) => Ok(py.NotImplemented()),
-            Err(e) => Err(raise(py, e)),
+        let value = match evaluation {
+            Ok(Ok(value)) => value,
+            Ok(Err(NotPlain)) => return Ok(py.NotImplemented()),
+            Err(e) => return Err(raise(py, e)),
+        };
+        if value.is_none() && has_fallback {
+            return Ok(py.None());
         }
+        let is_enabled = value.unwrap_or(false);
+        let impression = self.impression(py, &name)?;
+        if count {
+            self.count_toggle_quietly(&name, is_enabled);
+        }
+        Ok((is_enabled, value.is_some(), impression).into_py(py))
     }
 
-    /// See `variant_to_py`; `NotImplemented` when outside the fast path.
-    fn get_variant(
+    /// 2.0.0's `get_variant` / `check_variant` steps for a plain context, in one call:
+    /// resolve the variant, ask whether an impression event is due, then, when `count`
+    /// is set, count the toggle and the variant (the disabled variant for an unknown
+    /// toggle). Errors are handled as in `resolve_toggle`.
+    ///
+    /// Returns `NotImplemented` when the name or context is outside the fast path,
+    /// otherwise `(variant, requires_impression_event_emission)` with `variant` as
+    /// `variant_to_py` builds it.
+    #[pyo3(signature = (name, context, count))]
+    fn resolve_variant(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         context: &Bound<'_, PyAny>,
+        count: bool,
     ) -> PyResult<PyObject> {
         let (Some(name), Ok(context)) = (fast_name(name), context.downcast_exact::<PyDict>())
         else {
             return Ok(py.NotImplemented());
         };
         let no_custom_results = HashMap::new();
-        let outcome = guard(|| {
+        let resolution = guard(|| {
             Ok(with_plain_context(
                 context,
                 &name,
@@ -399,11 +450,23 @@ impl NativeEngine {
                 |enriched| variant_response(&self.lock(), enriched),
             ))
         });
-        match outcome {
-            Ok(Ok(variant)) => Ok(variant_to_py(py, variant)),
-            Ok(Err(NotPlain)) => Ok(py.NotImplemented()),
-            Err(e) => Err(raise(py, e)),
+        let variant = match resolution {
+            Ok(Ok(variant)) => variant,
+            Ok(Err(NotPlain)) => return Ok(py.NotImplemented()),
+            Err(e) => return Err(raise(py, e)),
+        };
+        let impression = self.impression(py, &name)?;
+        if count {
+            // 2.0.0 counts the Variant it built, so an unknown toggle counts as the
+            // disabled variant, and the variant name crosses ctypes as a C string.
+            let (feature_enabled, variant_name) = match &variant {
+                Some(v) => (v.feature_enabled, until_nul(Cow::Borrowed(v.name.as_str()))),
+                None => (false, Cow::Borrowed("disabled")),
+            };
+            self.count_toggle_quietly(&name, feature_enabled);
+            self.count_variant_quietly(&name, &variant_name);
         }
+        Ok((variant_to_py(py, variant), impression).into_py(py))
     }
 
     // --- evaluation, exact path (the native library's own steps) ----------------
@@ -455,7 +518,7 @@ impl NativeEngine {
 
     // --- metrics -------------------------------------------------------------------
 
-    /// Native errors are ignored here, as in 1.3.1 (it frees the response unread).
+    /// Native errors are ignored here, as in 2.0.0 (it frees the response unread).
     /// Returns `NotImplemented` when the name needs the Python slow path.
     fn count_toggle(
         &self,
@@ -467,10 +530,7 @@ impl NativeEngine {
             return Ok(py.NotImplemented());
         };
         let enabled = c_bool(py, enabled, 3)?;
-        let _ = guard(|| {
-            self.lock().count_toggle(&name, enabled);
-            Ok(())
-        });
+        self.count_toggle_quietly(&name, enabled);
         Ok(py.None())
     }
 
@@ -499,10 +559,7 @@ impl NativeEngine {
         let (Some(name), Some(variant)) = (fast_name(name), fast_name(variant)) else {
             return py.NotImplemented();
         };
-        let _ = guard(|| {
-            self.lock().count_variant(&name, &variant);
-            Ok(())
-        });
+        self.count_variant_quietly(&name, &variant);
         py.None()
     }
 
@@ -532,9 +589,7 @@ impl NativeEngine {
         let Some(name) = fast_name(name) else {
             return Ok(py.NotImplemented());
         };
-        guard(|| Ok(self.lock().should_emit_impression_event(&name)))
-            .map(|emit| emit.into_py(py))
-            .map_err(|e| raise(py, e))
+        Ok(self.impression(py, &name)?.into_py(py))
     }
 
     #[pyo3(signature = (name))]
@@ -702,6 +757,6 @@ impl NativeEngine {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeEngine>()?;
     m.add_function(wrap_pyfunction!(_set_error_class, m)?)?;
-    m.add("__core_version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__core_version__", unleash_yggdrasil::CORE_VERSION)?;
     Ok(())
 }

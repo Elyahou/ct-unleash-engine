@@ -1,8 +1,8 @@
-# Verbatim copy of yggdrasil_engine/custom_strategy.py from yggdrasil-engine 1.3.1,
+# Verbatim copy of yggdrasil_engine/custom_strategy.py from yggdrasil-engine 2.0.0,
 # so custom strategies are collected and evaluated exactly as the reference engine
 # does. That includes its quirks (for example `applicationHostname` is missing from
 # _STANDARD_STRATEGIES, and a toggle without "strategies" raises KeyError). They are
-# kept on purpose: changing anything here makes results diverge from 1.3.1.
+# kept on purpose: changing anything here makes results diverge from 2.0.0.
 #
 # Original work: https://github.com/Unleash/yggdrasil-bindings (python-engine)
 #
@@ -28,9 +28,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import inspect
 import json
 from typing import Dict
-import inspect
 
 _STANDARD_STRATEGIES = [
     "default",
@@ -60,7 +60,6 @@ def get_features_json(message):
 
 
 class CustomStrategyHandler:
-
     def __init__(self):
         self.strategy_definitions = {}
         self.strategy_implementations = {}
